@@ -1,0 +1,66 @@
+@import 'tailwindcss';
+
+:root {
+	font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+	color: #242321;
+	background: #f5f3ee;
+	font-synthesis: none;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; min-height: 100vh; }
+button, input { font: inherit; }
+button { color: inherit; }
+
+main {
+	min-height: 100vh;
+	display: flex;
+	flex-direction: column;
+}
+
+header { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 25px; }
+.brand { display: inline-flex; align-items: center; gap: 11px; color: inherit; text-decoration: none; font-size: 21px; font-weight: 720; letter-spacing: -0.04em; }
+.brand-mark { width: 34px; height: 34px; display: grid; place-items: center; color: white; background: #252421; border-radius: 10px; transform: rotate(-2deg); }
+.brand-mark svg { width: 19px; }
+header p { margin: 0; color: #8b8880; font-size: 14px; }
+
+.workspace { flex: 1; min-height: 0; display: flex; flex-direction: column; max-width: 1440px; width: 100%; margin: 0 auto; }
+.toolbar { min-height: 64px; padding: 11px 14px; display: flex; align-items: center; gap: 18px; background: #fff; border: 1px solid #e4e0d8; border-bottom: 0; border-radius: 18px 18px 0 0; box-shadow: 0 12px 35px rgba(52, 47, 38, 0.055); }
+.color-tools { display: flex; gap: 8px; align-items: center; }
+.swatch { --swatch: #000; width: 25px; height: 25px; padding: 0; border: 3px solid white; border-radius: 50%; background: var(--swatch); box-shadow: 0 0 0 1px #d9d6cf; cursor: pointer; transition: transform .15s, box-shadow .15s; }
+.swatch:hover { transform: scale(1.1); }
+.swatch.active { box-shadow: 0 0 0 2px #292825; transform: scale(1.04); }
+.divider { height: 25px; width: 1px; background: #e6e2da; }
+.size-control { display: flex; align-items: center; gap: 12px; font-size: 13px; color: #67645e; }
+.size-control input { width: 110px; accent-color: #292825; cursor: pointer; }
+.size-control output { min-width: 28px; padding: 4px 6px; text-align: center; color: #69665f; background: #f3f1ed; border-radius: 6px; font-size: 12px; }
+.toolbar-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+.icon-button, .clear-button { height: 38px; border-radius: 9px; cursor: pointer; transition: background .15s, opacity .15s; }
+.icon-button { display: flex; align-items: center; gap: 7px; padding: 0 12px; border: 1px solid #e2ded6; background: white; font-size: 13px; font-weight: 600; }
+.icon-button svg { width: 17px; }
+.clear-button { padding: 0 15px; border: 0; background: #292825; color: white; font-size: 13px; font-weight: 650; }
+.icon-button:hover:not(:disabled) { background: #f5f3ef; }
+.clear-button:hover:not(:disabled) { background: #44413d; }
+button:disabled { cursor: not-allowed; opacity: .35; }
+
+/* .canvas-frame { position: relative; flex: 1; height: 100%; min-height: 440px; overflow: hidden; border: 1px solid #e4e0d8; border-radius: 0 0 18px 18px; background-color: #fff; background-image: radial-gradient(#ddd9d0 0.75px, transparent 0.75px); background-size: 20px 20px; box-shadow: 0 18px 45px rgba(52, 47, 38, 0.08); } */
+canvas { display: block; position: absolute; top:0px;  width: 100%; height: 100%; min-height: 440px; touch-action: none; cursor: crosshair; position: relative; z-index: 1; }
+.empty-state { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; color: #aaa69d; font-size: 14px; pointer-events: none; } .empty-state svg { width: 31px; opacity: .55; }
+svg { fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+
+footer { display: flex; justify-content: center; align-items: center; gap: 10px; min-height: 54px; color: #99958d; font-size: 11px; }
+kbd { display: inline-grid; place-items: center; min-width: 20px; height: 20px; padding: 0 4px; border: 1px solid #d8d4cb; border-bottom-width: 2px; border-radius: 5px; background: #faf9f6; color: #706d66; font: inherit; }
+.footer-dot { color: #c8c4bb; }
+
+@media (max-width: 700px) {
+	main { padding: 20px 12px 12px; }
+	header { margin-bottom: 16px; }
+	header p { display: none; }
+	.toolbar { gap: 11px; flex-wrap: wrap; padding: 10px; }
+	.divider { display: none; }
+	.color-tools { width: calc(100% - 125px); }
+	.size-control { order: 3; width: 100%; }
+	.size-control input { flex: 1; }
+	.toolbar-actions { position: absolute; right: 23px; top: 76px; z-index: 2; }
+	/* .canvas-frame, canvas { min-height: 500px; } */
+}
