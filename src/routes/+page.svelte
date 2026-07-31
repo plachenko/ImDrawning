@@ -1,12 +1,15 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, untrack } from 'svelte';
 	import DrawingCanvas from '$lib/drawing/DrawingCanvas.svelte';
 	import DrawingToolbar from '$lib/drawing/DrawingToolbar.svelte';
 	import LayersPanel from '$lib/drawing/LayersPanel.svelte';
+	import CollaborationPanel from '$lib/drawing/CollaborationPanel.svelte';
+	import type { CollaborationUser } from '$lib/drawing/CollaborationPanel.svelte';
 	import type { Layer, LayerTransform, Point, Stroke } from '$lib/drawing/types';
 	type HistoryEntry =
 		| { kind: 'stroke'; layerId: number; strokeId: number; stroke: Stroke }
-		| { kind: 'transform'; layerId: number; before: LayerTransform; after: LayerTransform };
+		| { kind: 'transform'; layerId: number; before: LayerTransform; after: LayerTransform }
+		| { kind: 'edit'; layerId: number; strokeId: number; before: Point[]; after: Point[] };
 	type TransformGesture = {
 		kind: 'move' | 'scale' | 'rotate';
 		pointerId: number;
@@ -18,7 +21,13 @@
 	};
 
 	let canvas = $state<HTMLCanvasElement>(null!);
+	let overlayCanvas = $state<HTMLCanvasElement>(null!);
+	let collaborationPanel: CollaborationPanel;
+	let remoteLayerIds = new Map<string, number>();
+	let remoteCursors = $state<Record<string, CollaborationUser & { x: number; y: number; visible: boolean }>>({});
 	let context: CanvasRenderingContext2D | null = null;
+	let overlayContext: CanvasRenderingContext2D | null = null;
+	let strokePreviewFrame = 0;
 	let nextLayerId = 2;
 	let nextStrokeId = 1;
 	let layers = $state<Layer[]>([
@@ -53,9 +62,12 @@
 	let smoothingSteps = $state(4);
 	let taper = $state(35);
 	let isDrawing = $state(false);
-	let canvasWidth = 0;
-	let canvasHeight = 0;
-	let tool = $state<'draw' | 'transform' | 'pan'>('draw');
+	let canvasWidth = $state(0);
+	let canvasHeight = $state(0);
+	let tool = $state<'draw' | 'edit' | 'transform' | 'pan'>('draw');
+	let shape = $state<'freehand' | 'line' | 'rectangle' | 'ellipse' | 'bezier'>('freehand');
+	let selectedStrokeId = $state<number | null>(null);
+	let editGesture: { pointerId: number; stroke: Stroke; handle: number; before: Point[] } | null = null;
 	let camera = $state({ x: 0, y: 0, zoom: 1, rotation: 0 });
 	let gridVisible = $state(true);
 	let radialSlots = $state(['Draw', 'Undo', 'Transform', 'Reset view']);
@@ -70,11 +82,31 @@
 		angle: number;
 		rotation: number;
 	} | null = null;
+	let layerPinchGesture: {
+		distance: number;
+		angle: number;
+		worldMidpoint: Point;
+		before: LayerTransform;
+	} | null = null;
 	let multiTouchActive = false;
 	let pinchCache: { canvas: HTMLCanvasElement; origin: Point; scale: number } | null = null;
 	let transformGesture: TransformGesture | null = null;
+	let layerTransformCache: {
+		canvas: HTMLCanvasElement;
+		origin: Point;
+		scale: number;
+		layerId: number;
+	} | null = null;
+	let transformSceneCache: HTMLCanvasElement | null = null;
+	let transformPreviewFrame = 0;
 
 	const colors = ['#171717', '#ef4444', '#f59e0b', '#16a34a', '#2563eb', '#7c3aed'];
+	$effect(() => {
+		tool;
+		untrack(() => {
+			if (context) redraw(false);
+		});
+	});
 	function identityTransform(): LayerTransform {
 		return { x: 0, y: 0, rotation: 0, scaleX: 1, scaleY: 1 };
 	}
@@ -88,58 +120,127 @@
 
 	function drawStroke(stroke: Stroke, target = context) {
 		if (!target || stroke.points.length === 0) return;
-		const [first] = stroke.points;
 		target.save();
 		target.fillStyle = stroke.color;
+		const strokeShape = stroke.shape ?? 'freehand';
+
+		if (strokeShape !== 'freehand' && stroke.points.length > 1) {
+			const start = stroke.points[0];
+			const end = stroke.points[stroke.points.length - 1];
+			target.beginPath();
+			if (strokeShape === 'bezier' && stroke.points.length >= 4) {
+				target.moveTo(start.x, start.y);
+				target.bezierCurveTo(
+					stroke.points[1].x,
+					stroke.points[1].y,
+					stroke.points[2].x,
+					stroke.points[2].y,
+					stroke.points[3].x,
+					stroke.points[3].y
+				);
+			} else if (strokeShape === 'line') {
+				target.moveTo(start.x, start.y);
+				target.lineTo(end.x, end.y);
+			} else if (strokeShape === 'rectangle') {
+				target.rect(start.x, start.y, end.x - start.x, end.y - start.y);
+			} else {
+				const centerX = (start.x + end.x) / 2;
+				const centerY = (start.y + end.y) / 2;
+				target.ellipse(
+					centerX,
+					centerY,
+					Math.abs(end.x - start.x) / 2,
+					Math.abs(end.y - start.y) / 2,
+					0,
+					0,
+					Math.PI * 2
+				);
+			}
+			target.strokeStyle = stroke.color;
+			target.lineWidth = stroke.size;
+			target.lineCap = 'round';
+			target.lineJoin = 'round';
+			target.stroke();
+			target.restore();
+			return;
+		}
 
 		if (stroke.points.length === 1) {
+			const point = stroke.points[0];
+			const radius = stroke.size / 2;
 			target.beginPath();
-			target.arc(first.x, first.y, stroke.size / 2, 0, Math.PI * 2);
+			target.arc(point.x, point.y, radius, 0, Math.PI * 2);
 			target.fill();
 			target.restore();
 			return;
 		}
 
 		type WidthPoint = Point & { width: number; distance: number };
-		const samples: WidthPoint[] = [{ ...first, width: stroke.size, distance: 0 }];
-		const curveAmount = stroke.smoothing / 24;
-		let cursor = first;
-		for (let index = 1; index < stroke.points.length - 1; index++) {
-			const point = stroke.points[index];
-			const next = stroke.points[index + 1];
-			const end = {
-				x: point.x + (next.x - point.x) * curveAmount,
-				y: point.y + (next.y - point.y) * curveAmount
-			};
-			const sampleDistance = Math.hypot(point.x - stroke.points[index - 1].x, point.y - stroke.points[index - 1].y);
-			const width = stroke.size + Math.min(stroke.size * 0.9, Math.sqrt(sampleDistance) * 0.45);
-			const steps = Math.max(3, Math.ceil(Math.hypot(end.x - cursor.x, end.y - cursor.y) / 5));
-			const startWidth = samples[samples.length - 1].width;
-			for (let step = 1; step <= steps; step++) {
-				const amount = step / steps;
-				const inverse = 1 - amount;
-				const x = inverse * inverse * cursor.x + 2 * inverse * amount * point.x + amount * amount * end.x;
-				const y = inverse * inverse * cursor.y + 2 * inverse * amount * point.y + amount * amount * end.y;
-				const previous = samples[samples.length - 1];
-				samples.push({ x, y, width: startWidth + (width - startWidth) * amount, distance: previous.distance + Math.hypot(x - previous.x, y - previous.y) });
+		const samples: WidthPoint[] = [];
+		const bridgedPoints: Point[] = [];
+		const bridgeSpacing = Math.max(1, stroke.size * 0.4);
+		for (const point of stroke.points) {
+			const previous = bridgedPoints[bridgedPoints.length - 1];
+			if (previous) {
+				const gap = Math.hypot(point.x - previous.x, point.y - previous.y);
+				const steps = Math.ceil(gap / bridgeSpacing);
+				for (let step = 1; step < steps; step++) {
+					const amount = step / steps;
+					bridgedPoints.push({
+						x: previous.x + (point.x - previous.x) * amount,
+						y: previous.y + (point.y - previous.y) * amount,
+						time:
+							previous.time !== undefined && point.time !== undefined
+								? previous.time + (point.time - previous.time) * amount
+								: point.time
+					});
+				}
 			}
-			cursor = end;
+			bridgedPoints.push(point);
 		}
-		const last = stroke.points[stroke.points.length - 1];
-		const previousRaw = stroke.points[stroke.points.length - 2];
-		const finalDistance = Math.hypot(last.x - previousRaw.x, last.y - previousRaw.y);
-		const finalWidth = stroke.size + Math.min(stroke.size * 0.9, Math.sqrt(finalDistance) * 0.45);
-		const finalSteps = Math.max(3, Math.ceil(Math.hypot(last.x - cursor.x, last.y - cursor.y) / 5));
-		const finalStartWidth = samples[samples.length - 1].width;
-		for (let step = 1; step <= finalSteps; step++) {
-			const amount = step / finalSteps;
-			const x = cursor.x + (last.x - cursor.x) * amount;
-			const y = cursor.y + (last.y - cursor.y) * amount;
+		for (const point of bridgedPoints) {
 			const previous = samples[samples.length - 1];
-			samples.push({ x, y, width: finalStartWidth + (finalWidth - finalStartWidth) * amount, distance: previous.distance + Math.hypot(x - previous.x, y - previous.y) });
+			const segment = previous ? Math.hypot(point.x - previous.x, point.y - previous.y) : 0;
+			if (previous && segment < 0.25) continue;
+			samples.push({
+				...point,
+				width: stroke.size + Math.min(stroke.size * 0.9, Math.sqrt(segment) * 0.45),
+				distance: (previous?.distance ?? 0) + segment
+			});
+		}
+		if (samples.length === 1) samples.push({ ...samples[0] });
+
+		// Smooth the resampled centerline before deriving its edges. Resampling first
+		// lets the curve fill event gaps instead of cutting a straight, angular chord.
+		const smoothing = Math.max(0, Math.min(12, stroke.smoothing ?? 0));
+		const smoothingPasses = Math.ceil(smoothing / 3);
+		const smoothingStrength = (smoothing / 12) * 0.65;
+		for (let pass = 0; pass < smoothingPasses; pass++) {
+			const positions = samples.map((sample, index) => {
+				if (index === 0 || index === samples.length - 1) return sample;
+				const before = samples[index - 1];
+				const after = samples[index + 1];
+				return {
+					x: sample.x + ((before.x + after.x) / 2 - sample.x) * smoothingStrength,
+					y: sample.y + ((before.y + after.y) / 2 - sample.y) * smoothingStrength
+				};
+			});
+			for (let index = 1; index < samples.length - 1; index++) {
+				samples[index].x = positions[index].x;
+				samples[index].y = positions[index].y;
+			}
+		}
+		samples[0].distance = 0;
+		for (let index = 1; index < samples.length; index++) {
+			samples[index].distance =
+				samples[index - 1].distance +
+				Math.hypot(
+					samples[index].x - samples[index - 1].x,
+					samples[index].y - samples[index - 1].y
+				);
 		}
 
-		// Pointer events arrive at uneven intervals. Two weighted passes remove those
+		// Pointer events arrive at uneven intervals. Weighted passes remove those
 		// timing spikes without flattening intentional changes in stroke width.
 		for (let pass = 0; pass < 3; pass++) {
 			const widths = samples.map((sample, index) => {
@@ -152,38 +253,64 @@
 
 		const totalDistance = samples[samples.length - 1].distance || 1;
 		const taperDistance = totalDistance * (((stroke.taper ?? 0) / 100) * 0.5);
+		const tip = samples[samples.length - 1];
+		const previousTip = samples[samples.length - 2];
+		const elapsed = Math.max(1, (tip.time ?? 0) - (previousTip.time ?? 0));
+		const velocity = Math.hypot(tip.x - previousTip.x, tip.y - previousTip.y) / elapsed;
+		const sharpness = Math.max(0, Math.min(1, (velocity - 0.04) / 0.9));
+		const tipLength = stroke.size * (0.65 + sharpness * 2.35);
+		const baseDistance = Math.max(0, totalDistance - tipLength);
+		const railSamples = samples.filter((sample) => sample.distance < baseDistance);
+		const afterBase = samples.find((sample) => sample.distance >= baseDistance) ?? tip;
+		const beforeBase = samples[Math.max(0, samples.indexOf(afterBase) - 1)];
+		const baseSpan = afterBase.distance - beforeBase.distance;
+		const baseAmount = baseSpan > 0 ? (baseDistance - beforeBase.distance) / baseSpan : 0;
+		railSamples.push({
+			x: beforeBase.x + (afterBase.x - beforeBase.x) * baseAmount,
+			y: beforeBase.y + (afterBase.y - beforeBase.y) * baseAmount,
+			width: beforeBase.width + (afterBase.width - beforeBase.width) * baseAmount,
+			distance: baseDistance,
+			time: beforeBase.time
+		});
+
 		const edge = (sample: WidthPoint, index: number, side: -1 | 1) => {
-			const before = samples[Math.max(0, index - 2)];
-			const after = samples[Math.min(samples.length - 1, index + 2)];
+			const before = railSamples[Math.max(0, index - 1)];
+			const after = railSamples[Math.min(railSamples.length - 1, index + 1)];
 			const tangentX = after.x - before.x;
 			const tangentY = after.y - before.y;
 			const length = Math.hypot(tangentX, tangentY) || 1;
-			const taperScale = taperDistance > 0 ? Math.min(1, sample.distance / taperDistance, (totalDistance - sample.distance) / taperDistance) : 1;
+			const taperScale = taperDistance > 0 ? Math.min(1, sample.distance / taperDistance) : 1;
 			// A diagonal calligraphic axis distributes ink according to direction.
 			// Up-left motion biases the right side; down-right reverses that bias.
-			const angleBias = Math.max(-1, Math.min(1, (-tangentX - tangentY) / (length * Math.SQRT2))) * 0.34;
+			const angleBias =
+				Math.max(-1, Math.min(1, (-tangentX - tangentY) / (length * Math.SQRT2))) * 0.34;
 			const sideWeight = 1 - side * angleBias;
 			const radius = (sample.width / 2) * Math.max(0, taperScale) * sideWeight;
-			return { x: sample.x + (-tangentY / length) * radius * side, y: sample.y + (tangentX / length) * radius * side };
+			return {
+				x: sample.x + (-tangentY / length) * radius * side,
+				y: sample.y + (tangentX / length) * radius * side
+			};
 		};
-		const left = samples.map((sample, index) => edge(sample, index, 1));
-		const right = samples.map((sample, index) => edge(sample, index, -1)).reverse();
-		const outline = [...left, ...right];
+		// Faster motion moves the triangle's shoulders farther behind the pointer,
+		// producing a longer, sharper brush tip while the polygon follows its base.
+		const left = railSamples.map((sample, index) => edge(sample, index, 1));
+		const right = railSamples.map((sample, index) => edge(sample, index, -1)).reverse();
+		const outline = [...left, tip, ...right];
 		target.beginPath();
-		target.moveTo(outline[0].x, outline[0].y);
-		for (let index = 1; index < outline.length - 1; index++) {
+		const first = outline[0];
+		const last = outline[outline.length - 1];
+		target.moveTo((last.x + first.x) / 2, (last.y + first.y) / 2);
+		for (let index = 0; index < outline.length; index++) {
 			const point = outline[index];
-			const next = outline[index + 1];
+			const next = outline[(index + 1) % outline.length];
 			target.quadraticCurveTo(point.x, point.y, (point.x + next.x) / 2, (point.y + next.y) / 2);
 		}
-		const outlineLast = outline[outline.length - 1];
-		target.lineTo(outlineLast.x, outlineLast.y);
 		target.closePath();
 		target.fill();
 		target.restore();
 	}
 
-	function redraw() {
+	function redraw(includeActiveStroke = true) {
 		if (!context) return;
 		context.clearRect(0, 0, canvasWidth, canvasHeight);
 		if (gridVisible) drawGrid();
@@ -205,14 +332,57 @@
 				context.save();
 				context.globalAlpha = layer.opacity;
 				applyLayerTransform(layer);
-				if (layer.image) context.drawImage(layer.image.element, layer.image.x, layer.image.y, layer.image.width, layer.image.height);
-				for (const stroke of layer.strokes) drawStroke(stroke);
-				if (layer.id === activeLayerId && activeStroke) drawStroke(activeStroke);
+				if (layerTransformCache?.layerId === layer.id) {
+					context.restore();
+					continue;
+				} else if (layer.image)
+					context.drawImage(
+						layer.image.element,
+						layer.image.x,
+						layer.image.y,
+						layer.image.width,
+						layer.image.height
+					);
+				if (layerTransformCache?.layerId !== layer.id)
+					for (const stroke of layer.strokes) drawStroke(stroke);
+				if (includeActiveStroke && layer.id === activeLayerId && activeStroke)
+					drawStroke(activeStroke);
 				context.restore();
 			}
 		}
 		context.globalAlpha = 1;
 		if (tool === 'transform') drawTransformControls();
+		if (tool === 'edit') drawEditControls();
+		context.restore();
+	}
+
+	function editableStroke() {
+		return activeLayer.strokes.find((stroke) => stroke.id === selectedStrokeId) ?? null;
+	}
+
+	function drawEditControls() {
+		if (!context) return;
+		const stroke = editableStroke();
+		if (!stroke || (stroke.shape ?? 'freehand') === 'freehand') return;
+		context.save();
+		applyLayerTransform(activeLayer);
+		context.lineWidth = 1.25 / camera.zoom;
+		context.strokeStyle = '#2563eb';
+		context.fillStyle = '#fff';
+		if (stroke.shape === 'bezier' && stroke.points.length >= 4) {
+			context.beginPath();
+			context.moveTo(stroke.points[0].x, stroke.points[0].y);
+			context.lineTo(stroke.points[1].x, stroke.points[1].y);
+			context.moveTo(stroke.points[2].x, stroke.points[2].y);
+			context.lineTo(stroke.points[3].x, stroke.points[3].y);
+			context.stroke();
+		}
+		for (const point of stroke.points) {
+			context.beginPath();
+			context.arc(point.x, point.y, 5 / camera.zoom, 0, Math.PI * 2);
+			context.fill();
+			context.stroke();
+		}
 		context.restore();
 	}
 
@@ -411,10 +581,37 @@
 		canvasHeight = rect.height;
 		canvas.width = Math.round(rect.width * dpr);
 		canvas.height = Math.round(rect.height * dpr);
+		overlayCanvas.width = canvas.width;
+		overlayCanvas.height = canvas.height;
 		context = canvas.getContext('2d');
+		overlayContext = overlayCanvas.getContext('2d');
 		context?.setTransform(dpr, 0, 0, dpr, 0, 0);
+		overlayContext?.setTransform(dpr, 0, 0, dpr, 0, 0);
 		configureContext();
 		redraw();
+	}
+
+	function clearStrokePreview() {
+		if (!overlayContext) return;
+		overlayContext.clearRect(0, 0, canvasWidth, canvasHeight);
+	}
+
+	function renderStrokePreview() {
+		strokePreviewFrame = 0;
+		clearStrokePreview();
+		if (!overlayContext || !activeStroke) return;
+		overlayContext.save();
+		overlayContext.translate(camera.x, camera.y);
+		overlayContext.rotate(camera.rotation);
+		overlayContext.scale(camera.zoom, camera.zoom);
+		applyLayerTransform(activeLayer, overlayContext);
+		overlayContext.globalAlpha = activeLayer.opacity;
+		drawStroke(activeStroke, overlayContext);
+		overlayContext.restore();
+	}
+
+	function scheduleStrokePreview() {
+		if (!strokePreviewFrame) strokePreviewFrame = requestAnimationFrame(renderStrokePreview);
 	}
 
 	function position(event: PointerEvent): Point {
@@ -425,18 +622,25 @@
 	function screenToWorld(point: Point): Point {
 		const x = (point.x - camera.x) / camera.zoom;
 		const y = (point.y - camera.y) / camera.zoom;
-		const cosine = Math.cos(camera.rotation), sine = Math.sin(camera.rotation);
+		const cosine = Math.cos(camera.rotation),
+			sine = Math.sin(camera.rotation);
 		return { x: x * cosine + y * sine, y: -x * sine + y * cosine };
 	}
 
-	function placeWorldPointAtScreen(world: Point, screen: Point, zoom = camera.zoom, rotation = camera.rotation) {
-		const cosine = Math.cos(rotation), sine = Math.sin(rotation);
+	function placeWorldPointAtScreen(
+		world: Point,
+		screen: Point,
+		zoom = camera.zoom,
+		rotation = camera.rotation
+	) {
+		const cosine = Math.cos(rotation),
+			sine = Math.sin(rotation);
 		camera.x = screen.x - (world.x * cosine - world.y * sine) * zoom;
 		camera.y = screen.y - (world.x * sine + world.y * cosine) * zoom;
 	}
 
 	function localPosition(event: PointerEvent) {
-		return inverseTransformPoint(screenToWorld(position(event)));
+		return { ...inverseTransformPoint(screenToWorld(position(event))), time: event.timeStamp };
 	}
 
 	function touchMidpoint() {
@@ -460,6 +664,83 @@
 		panGesture = null;
 		if (transformGesture) activeLayer.transform = copyTransform(transformGesture.before);
 		transformGesture = null;
+		if (transformPreviewFrame) cancelAnimationFrame(transformPreviewFrame);
+		transformPreviewFrame = 0;
+		layerTransformCache = null;
+		transformSceneCache = null;
+	}
+
+	function redrawTransformPreview() {
+		if (!context || !layerTransformCache || !transformSceneCache) return;
+		context.clearRect(0, 0, canvasWidth, canvasHeight);
+		context.drawImage(transformSceneCache, 0, 0, canvasWidth, canvasHeight);
+		context.save();
+		context.translate(camera.x, camera.y);
+		context.rotate(camera.rotation);
+		context.scale(camera.zoom, camera.zoom);
+		context.globalAlpha = activeLayer.opacity;
+		applyLayerTransform(activeLayer);
+		context.drawImage(
+			layerTransformCache.canvas,
+			layerTransformCache.origin.x,
+			layerTransformCache.origin.y,
+			layerTransformCache.canvas.width / layerTransformCache.scale,
+			layerTransformCache.canvas.height / layerTransformCache.scale
+		);
+		context.restore();
+	}
+
+	function scheduleTransformPreview() {
+		if (transformPreviewFrame) return;
+		transformPreviewFrame = requestAnimationFrame(() => {
+			transformPreviewFrame = 0;
+			redrawTransformPreview();
+		});
+	}
+
+	function buildLayerTransformCache() {
+		const bounds = layerBounds(activeLayer);
+		if (!bounds) return;
+		const width = Math.max(1, bounds.maxX - bounds.minX);
+		const height = Math.max(1, bounds.maxY - bounds.minY);
+		const desiredScale = Math.max(1, camera.zoom * (window.devicePixelRatio || 1));
+		const scale = Math.min(
+			desiredScale,
+			4096 / width,
+			4096 / height,
+			Math.sqrt(8_000_000 / (width * height))
+		);
+		const cachedCanvas = document.createElement('canvas');
+		cachedCanvas.width = Math.max(1, Math.ceil(width * scale));
+		cachedCanvas.height = Math.max(1, Math.ceil(height * scale));
+		const cachedContext = cachedCanvas.getContext('2d');
+		if (!cachedContext) return;
+		cachedContext.scale(scale, scale);
+		cachedContext.translate(-bounds.minX, -bounds.minY);
+		if (activeLayer.image)
+			cachedContext.drawImage(
+				activeLayer.image.element,
+				activeLayer.image.x,
+				activeLayer.image.y,
+				activeLayer.image.width,
+				activeLayer.image.height
+			);
+		for (const stroke of activeLayer.strokes) drawStroke(stroke, cachedContext);
+		layerTransformCache = {
+			canvas: cachedCanvas,
+			origin: { x: bounds.minX, y: bounds.minY },
+			scale,
+			layerId: activeLayer.id
+		};
+		// Freeze everything except the active layer. Pointer movement now composites
+		// only this background bitmap and the layer bitmap.
+		redraw();
+		const scene = document.createElement('canvas');
+		scene.width = canvas.width;
+		scene.height = canvas.height;
+		scene.getContext('2d')?.drawImage(canvas, 0, 0);
+		transformSceneCache = scene;
+		redrawTransformPreview();
 	}
 
 	function beginPinch() {
@@ -470,11 +751,65 @@
 		pinchGesture = {
 			distance: Math.max(1, touchDistance()),
 			worldMidpoint: screenToWorld(midpoint),
-			zoom: camera.zoom
-			,angle: touchAngle(),
+			zoom: camera.zoom,
+			angle: touchAngle(),
 			rotation: camera.rotation
 		};
 		redraw();
+	}
+
+	function isNearActiveLayer(screenPoint: Point) {
+		const bounds = layerBounds(activeLayer);
+		if (!bounds || activeLayer.locked || !activeLayer.visible) return false;
+		const center = transformPoint(bounds.center);
+		const corners = [
+			transformPoint({ x: bounds.minX, y: bounds.minY }),
+			transformPoint({ x: bounds.maxX, y: bounds.minY }),
+			transformPoint({ x: bounds.maxX, y: bounds.maxY }),
+			transformPoint({ x: bounds.minX, y: bounds.maxY })
+		];
+		const objectRadius = Math.max(
+			...corners.map((corner) => Math.hypot(corner.x - center.x, corner.y - center.y))
+		);
+		const point = screenToWorld(screenPoint);
+		const touchRadius = 48 / camera.zoom;
+		return Math.hypot(point.x - center.x, point.y - center.y) <= objectRadius + touchRadius;
+	}
+
+	function beginLayerPinch() {
+		const midpoint = touchMidpoint();
+		if (!isNearActiveLayer(midpoint)) return false;
+		cancelCanvasInteraction();
+		stabilizeTransformPivot(activeLayer);
+		buildLayerTransformCache();
+		multiTouchActive = true;
+		layerPinchGesture = {
+			distance: Math.max(1, touchDistance()),
+			angle: touchAngle(),
+			worldMidpoint: screenToWorld(midpoint),
+			before: copyTransform(activeLayer.transform)
+		};
+		redrawTransformPreview();
+		return true;
+	}
+
+	function commitLayerPinch() {
+		if (!layerPinchGesture) return;
+		const after = copyTransform(activeLayer.transform);
+		if (JSON.stringify(layerPinchGesture.before) !== JSON.stringify(after)) {
+			globalUndo.push({
+				kind: 'transform',
+				layerId: activeLayer.id,
+				before: layerPinchGesture.before,
+				after
+			});
+			globalRedo.length = 0;
+		}
+		layerPinchGesture = null;
+		if (transformPreviewFrame) cancelAnimationFrame(transformPreviewFrame);
+		transformPreviewFrame = 0;
+		layerTransformCache = null;
+		transformSceneCache = null;
 	}
 
 	function buildPinchCache() {
@@ -486,7 +821,12 @@
 		const width = Math.max(1, bounds.maxX - bounds.minX);
 		const height = Math.max(1, bounds.maxY - bounds.minY);
 		const desiredScale = Math.max(0.25, camera.zoom * (window.devicePixelRatio || 1));
-		const scale = Math.min(desiredScale, 4096 / width, 4096 / height, Math.sqrt(8_000_000 / (width * height)));
+		const scale = Math.min(
+			desiredScale,
+			4096 / width,
+			4096 / height,
+			Math.sqrt(8_000_000 / (width * height))
+		);
 		const cachedCanvas = document.createElement('canvas');
 		cachedCanvas.width = Math.max(1, Math.ceil(width * scale));
 		cachedCanvas.height = Math.max(1, Math.ceil(height * scale));
@@ -494,14 +834,96 @@
 		pinchCache = { canvas: cachedCanvas, origin: { x: bounds.minX, y: bounds.minY }, scale };
 	}
 
+	function distanceToSegment(point: Point, start: Point, end: Point) {
+		const dx = end.x - start.x;
+		const dy = end.y - start.y;
+		const lengthSquared = dx * dx + dy * dy;
+		const amount = lengthSquared
+			? Math.max(0, Math.min(1, ((point.x - start.x) * dx + (point.y - start.y) * dy) / lengthSquared))
+			: 0;
+		return Math.hypot(point.x - (start.x + dx * amount), point.y - (start.y + dy * amount));
+	}
+
+	function strokeHitDistance(stroke: Stroke, point: Point) {
+		const shapeType = stroke.shape ?? 'freehand';
+		if (shapeType === 'freehand') return Infinity;
+		const points: Point[] = [];
+		const start = stroke.points[0];
+		const end = stroke.points[stroke.points.length - 1];
+		if (!start || !end) return Infinity;
+		if (shapeType === 'line') points.push(start, end);
+		else if (shapeType === 'rectangle')
+			points.push(start, { x: end.x, y: start.y }, end, { x: start.x, y: end.y }, start);
+		else if (shapeType === 'ellipse') {
+			const centerX = (start.x + end.x) / 2;
+			const centerY = (start.y + end.y) / 2;
+			for (let index = 0; index <= 32; index++) {
+				const angle = (index / 32) * Math.PI * 2;
+				points.push({
+					x: centerX + Math.cos(angle) * Math.abs(end.x - start.x) / 2,
+					y: centerY + Math.sin(angle) * Math.abs(end.y - start.y) / 2
+				});
+			}
+		} else if (stroke.points.length >= 4) {
+			const [p0, p1, p2, p3] = stroke.points;
+			for (let index = 0; index <= 32; index++) {
+				const t = index / 32;
+				const inverse = 1 - t;
+				points.push({
+					x: inverse ** 3 * p0.x + 3 * inverse ** 2 * t * p1.x + 3 * inverse * t ** 2 * p2.x + t ** 3 * p3.x,
+					y: inverse ** 3 * p0.y + 3 * inverse ** 2 * t * p1.y + 3 * inverse * t ** 2 * p2.y + t ** 3 * p3.y
+				});
+			}
+		}
+		let distance = Infinity;
+		for (let index = 1; index < points.length; index++)
+			distance = Math.min(distance, distanceToSegment(point, points[index - 1], points[index]));
+		return distance;
+	}
+
+	function startEdit(event: PointerEvent) {
+		if (activeLayer.locked || (event.button !== 0 && event.pointerType === 'mouse')) return;
+		const point = localPosition(event);
+		const threshold = 12 / camera.zoom;
+		let stroke = editableStroke();
+		let handle = stroke?.points.findIndex((candidate) => Math.hypot(candidate.x - point.x, candidate.y - point.y) <= threshold) ?? -1;
+		if (handle < 0) {
+			stroke = [...activeLayer.strokes]
+				.reverse()
+				.find((candidate) => strokeHitDistance(candidate, point) <= threshold + candidate.size / 2) ?? null;
+			selectedStrokeId = stroke?.id ?? null;
+			handle = stroke?.points.findIndex((candidate) => Math.hypot(candidate.x - point.x, candidate.y - point.y) <= threshold) ?? -1;
+		}
+		if (stroke && handle >= 0) {
+			overlayCanvas.setPointerCapture(event.pointerId);
+			editGesture = {
+				pointerId: event.pointerId,
+				stroke,
+				handle,
+				before: stroke.points.map((candidate) => ({ ...candidate }))
+			};
+		}
+		redraw(false);
+	}
+
 	function startDrawing(event: PointerEvent) {
 		const pressPoint = position(event);
 		const now = performance.now();
-		if (touchPoints.size === 0 && lastCanvasPress && now - lastCanvasPress.time < 320 && Math.hypot(pressPoint.x - lastCanvasPress.point.x, pressPoint.y - lastCanvasPress.point.y) < 28) {
+		if (
+			touchPoints.size === 0 &&
+			lastCanvasPress &&
+			now - lastCanvasPress.time < 320 &&
+			Math.hypot(pressPoint.x - lastCanvasPress.point.x, pressPoint.y - lastCanvasPress.point.y) <
+				28
+		) {
 			lastCanvasPress = null;
 			const lastStroke = activeLayer.strokes[activeLayer.strokes.length - 1];
 			const lastHistory = globalUndo[globalUndo.length - 1];
-			if (lastStroke?.points.length <= 2 && lastHistory?.kind === 'stroke' && lastHistory.strokeId === lastStroke.id) {
+			if (
+				lastStroke?.points.length <= 2 &&
+				lastHistory?.kind === 'stroke' &&
+				lastHistory.strokeId === lastStroke.id
+			) {
 				activeLayer.strokes.pop();
 				globalUndo.pop();
 			}
@@ -511,16 +933,16 @@
 		lastCanvasPress = { time: now, point: pressPoint };
 		if (event.pointerType === 'touch') {
 			touchPoints.set(event.pointerId, position(event));
-			canvas.setPointerCapture(event.pointerId);
+			overlayCanvas.setPointerCapture(event.pointerId);
 			if (touchPoints.size >= 2) {
-				beginPinch();
+				if (tool !== 'transform' || !beginLayerPinch()) beginPinch();
 				return;
 			}
 			if (multiTouchActive) return;
 		}
 		if (tool === 'pan') {
 			if (event.button !== 0 && event.pointerType === 'mouse') return;
-			canvas.setPointerCapture(event.pointerId);
+			overlayCanvas.setPointerCapture(event.pointerId);
 			panGesture = { pointerId: event.pointerId, start: position(event), x: camera.x, y: camera.y };
 			return;
 		}
@@ -528,11 +950,15 @@
 			startTransform(event);
 			return;
 		}
+		if (tool === 'edit') {
+			startEdit(event);
+			return;
+		}
 		if (activeLayer.locked) return;
 		if (event.button !== 0 && event.pointerType === 'mouse') return;
 		stabilizeTransformPivot(activeLayer);
 		if (!activeLayer.visible) activeLayer.visible = true;
-		canvas.setPointerCapture(event.pointerId);
+		overlayCanvas.setPointerCapture(event.pointerId);
 		isDrawing = true;
 		activeStroke = {
 			id: nextStrokeId++,
@@ -540,14 +966,96 @@
 			color,
 			size: brushSize,
 			smoothing: smoothingSteps,
-			taper
+			taper,
+			shape
 		};
-		redraw();
+		clearStrokePreview();
+		scheduleStrokePreview();
+	}
+
+	function draw2(event: PointerEvent) {
+		if (!isDrawing || !activeStroke) return;
+		const events = event.getCoalescedEvents?.() ?? [event];
+		if ((activeStroke.shape ?? 'freehand') === 'freehand') {
+			for (const sample of events) activeStroke.points.push(localPosition(sample));
+		} else {
+			const endpoint = localPosition(events[events.length - 1]);
+			if (activeStroke.points.length === 1) activeStroke.points.push(endpoint);
+			else activeStroke.points[1] = endpoint;
+		}
+		// Clear the previous preview while keeping committed artwork visible.
+		redraw(false);
+
+		if (!context || activeStroke.points.length < 2) return;
+		const points = activeStroke.points.slice(-6);
+		const tip = points[points.length - 1];
+		const previous = points[points.length - 2];
+		const angle = Math.atan2(tip.y - previous.y, tip.x - previous.x);
+		const triangleLength = Math.max(10, activeStroke.size * 2);
+		const triangleWidth = Math.max(7, activeStroke.size * 1.4);
+
+		context.save();
+		context.translate(camera.x, camera.y);
+		context.rotate(camera.rotation);
+		context.scale(camera.zoom, camera.zoom);
+		applyLayerTransform(activeLayer);
+
+		// Follow the recorded pointer positions with a midpoint-smoothed Bézier path.
+		context.beginPath();
+		context.moveTo(points[0].x, points[0].y);
+		for (let index = 1; index < points.length - 1; index++) {
+			const point = points[index];
+			const next = points[index + 1];
+			context.quadraticCurveTo(point.x, point.y, (point.x + next.x) / 2, (point.y + next.y) / 2);
+		}
+		context.lineTo(tip.x, tip.y);
+		context.strokeStyle = activeStroke.color;
+		context.lineWidth = activeStroke.size;
+		context.lineCap = 'round';
+		context.lineJoin = 'round';
+		context.stroke();
+
+		// Point the triangle along the most recent pair of input points.
+		context.beginPath();
+		context.moveTo(tip.x, tip.y);
+		context.lineTo(
+			tip.x - Math.cos(angle) * triangleLength + Math.sin(angle) * (triangleWidth / 2),
+			tip.y - Math.sin(angle) * triangleLength - Math.cos(angle) * (triangleWidth / 2)
+		);
+		context.lineTo(
+			tip.x - Math.cos(angle) * triangleLength - Math.sin(angle) * (triangleWidth / 2),
+			tip.y - Math.sin(angle) * triangleLength + Math.cos(angle) * (triangleWidth / 2)
+		);
+		context.closePath();
+		context.fillStyle = activeStroke.color;
+		context.fill();
+		context.restore();
 	}
 
 	function draw(event: PointerEvent) {
+		broadcastCursor(event);
 		if (event.pointerType === 'touch' && touchPoints.has(event.pointerId)) {
 			touchPoints.set(event.pointerId, position(event));
+			if (layerPinchGesture && touchPoints.size >= 2) {
+				const midpoint = touchMidpoint();
+				if (!isNearActiveLayer(midpoint)) {
+					commitLayerPinch();
+					beginPinch();
+					return;
+				}
+				const scale = touchDistance() / layerPinchGesture.distance;
+				const rotation = ((touchAngle() - layerPinchGesture.angle) * 180) / Math.PI;
+				const worldMidpoint = screenToWorld(midpoint);
+				activeLayer.transform.scaleX = Math.max(0.05, layerPinchGesture.before.scaleX * scale);
+				activeLayer.transform.scaleY = Math.max(0.05, layerPinchGesture.before.scaleY * scale);
+				activeLayer.transform.rotation = layerPinchGesture.before.rotation + rotation;
+				activeLayer.transform.x =
+					layerPinchGesture.before.x + worldMidpoint.x - layerPinchGesture.worldMidpoint.x;
+				activeLayer.transform.y =
+					layerPinchGesture.before.y + worldMidpoint.y - layerPinchGesture.worldMidpoint.y;
+				scheduleTransformPreview();
+				return;
+			}
 			if (pinchGesture && touchPoints.size >= 2) {
 				const midpoint = touchMidpoint();
 				const nextZoom = Math.min(
@@ -574,10 +1082,30 @@
 			updateTransform(event);
 			return;
 		}
+		if (editGesture && event.pointerId === editGesture.pointerId) {
+			editGesture.stroke.points[editGesture.handle] = localPosition(event);
+			redraw(false);
+			return;
+		}
 		if (!isDrawing || !activeStroke) return;
 		const events = event.getCoalescedEvents?.() ?? [event];
-		for (const sample of events) activeStroke.points.push(localPosition(sample));
-		redraw();
+		if ((activeStroke.shape ?? 'freehand') === 'freehand') {
+			for (const sample of events) activeStroke.points.push(localPosition(sample));
+		} else {
+			const start = activeStroke.points[0];
+			const endpoint = localPosition(events[events.length - 1]);
+			if (activeStroke.shape === 'bezier') {
+				const dx = endpoint.x - start.x;
+				activeStroke.points = [
+					start,
+					{ x: start.x + dx / 3, y: start.y },
+					{ x: endpoint.x - dx / 3, y: endpoint.y },
+					endpoint
+				];
+			} else if (activeStroke.points.length === 1) activeStroke.points.push(endpoint);
+			else activeStroke.points[1] = endpoint;
+		}
+		scheduleStrokePreview();
 	}
 
 	function stopDrawing(event?: PointerEvent) {
@@ -586,16 +1114,19 @@
 			if (multiTouchActive) {
 				pinchGesture = null;
 				if (touchPoints.size === 0) {
+					commitLayerPinch();
 					multiTouchActive = false;
 					pinchCache = null;
 					redraw();
 				}
-				if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+				if (overlayCanvas.hasPointerCapture(event.pointerId))
+					overlayCanvas.releasePointerCapture(event.pointerId);
 				return;
 			}
 		}
 		if (panGesture) {
-			if (event && canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+			if (event && overlayCanvas.hasPointerCapture(event.pointerId))
+				overlayCanvas.releasePointerCapture(event.pointerId);
 			panGesture = null;
 			return;
 		}
@@ -603,10 +1134,27 @@
 			finishTransform(event);
 			return;
 		}
+		if (editGesture) {
+			if (event && overlayCanvas.hasPointerCapture(event.pointerId))
+				overlayCanvas.releasePointerCapture(event.pointerId);
+			const after = editGesture.stroke.points.map((point) => ({ ...point }));
+			globalUndo.push({
+				kind: 'edit',
+				layerId: activeLayer.id,
+				strokeId: editGesture.stroke.id,
+				before: editGesture.before,
+				after
+			});
+			globalRedo.length = 0;
+			editGesture = null;
+			redraw(false);
+			return;
+		}
 		if (!isDrawing || !activeStroke) return;
-		if (event && canvas.hasPointerCapture(event.pointerId))
-			canvas.releasePointerCapture(event.pointerId);
+		if (event && overlayCanvas.hasPointerCapture(event.pointerId))
+			overlayCanvas.releasePointerCapture(event.pointerId);
 		activeLayer.strokes.push(activeStroke);
+		if ((activeStroke.shape ?? 'freehand') !== 'freehand') selectedStrokeId = activeStroke.id;
 		globalUndo.push({
 			kind: 'stroke',
 			layerId: activeLayer.id,
@@ -614,8 +1162,116 @@
 			stroke: activeStroke
 		});
 		globalRedo.length = 0;
+		collaborationPanel?.sendStroke(activeStroke);
+		if (strokePreviewFrame) cancelAnimationFrame(strokePreviewFrame);
+		strokePreviewFrame = 0;
+		clearStrokePreview();
 		activeStroke = null;
 		isDrawing = false;
+		redraw(false);
+	}
+
+	function ensureRemoteLayer(user: CollaborationUser) {
+		const existingId = remoteLayerIds.get(user.id);
+		const existing = layers.find((layer) => layer.id === existingId);
+		if (existing) return existing;
+		const layer: Layer = {
+			id: nextLayerId++,
+			name: `${user.name} · ${user.color}`,
+			visible: true,
+			locked: false,
+			opacity: 1,
+			strokes: [],
+			transform: identityTransform()
+		};
+		layers.push(layer);
+		remoteLayerIds.set(user.id, layer.id);
+		return layer;
+	}
+
+	function receiveRemoteStroke(user: CollaborationUser, stroke: Stroke) {
+		if (!stroke || !Array.isArray(stroke.points)) return;
+		const layer = ensureRemoteLayer(user);
+		const strokeId = nextStrokeId++;
+		const remoteStroke: Stroke = {
+			...stroke,
+			id: strokeId,
+			color: user.color,
+			points: stroke.points.map((point) => ({ ...point }))
+		};
+		if ((remoteStroke.shape ?? 'freehand') !== 'freehand' || remoteStroke.points.length < 3) {
+			layer.strokes.push(remoteStroke);
+			redraw(false);
+			const start = remoteStroke.points[0];
+			const end = remoteStroke.points[remoteStroke.points.length - 1];
+			if (start && end) {
+				const cursorStarted = performance.now();
+				const replayCursor = (now: number) => {
+					const amount = Math.min(1, (now - cursorStarted) / 260);
+					remoteCursors[user.id] = {
+						...user,
+						x: start.x + (end.x - start.x) * amount,
+						y: start.y + (end.y - start.y) * amount,
+						visible: true
+					};
+					if (amount < 1) requestAnimationFrame(replayCursor);
+				};
+				requestAnimationFrame(replayCursor);
+			}
+			return;
+		}
+		const completedPoints = remoteStroke.points;
+		remoteStroke.points = completedPoints.slice(0, 1);
+		layer.strokes.push(remoteStroke);
+		const started = performance.now();
+		const duration = Math.min(1400, Math.max(180, completedPoints.length * 10));
+		const replay = (now: number) => {
+			const progress = Math.min(1, (now - started) / duration);
+			const count = Math.max(1, Math.ceil(completedPoints.length * progress));
+			remoteStroke.points = completedPoints.slice(0, count);
+			const cursorPoint = completedPoints[count - 1];
+			remoteCursors[user.id] = {
+				...user,
+				x: cursorPoint.x,
+				y: cursorPoint.y,
+				visible: true
+			};
+			redraw(false);
+			if (progress < 1) requestAnimationFrame(replay);
+		};
+		requestAnimationFrame(replay);
+	}
+
+	function receiveRemoteCursor(user: CollaborationUser, x: number, y: number, visible: boolean) {
+		remoteCursors[user.id] = { ...user, x, y, visible };
+	}
+
+	function remoteCursorScreen(cursor: CollaborationUser & Point) {
+		const layer = layers.find((candidate) => candidate.id === remoteLayerIds.get(cursor.id));
+		const world = layer ? transformPoint(cursor, layer) : cursor;
+		const cosine = Math.cos(camera.rotation);
+		const sine = Math.sin(camera.rotation);
+		return {
+			x: camera.x + (world.x * cosine - world.y * sine) * camera.zoom,
+			y: camera.y + (world.x * sine + world.y * cosine) * camera.zoom
+		};
+	}
+
+	function remotePeerLeft(user: CollaborationUser) {
+		if (remoteCursors[user.id]) remoteCursors[user.id].visible = false;
+	}
+
+	function resetRemotePresence() {
+		for (const cursor of Object.values(remoteCursors)) cursor.visible = false;
+	}
+
+	function broadcastCursor(event: PointerEvent, visible = true) {
+		const point = localPosition(event);
+		collaborationPanel?.sendCursor(point.x, point.y, visible);
+	}
+
+	function pointerLeft(event: PointerEvent) {
+		broadcastCursor(event, false);
 	}
 
 	function startTransform(event: PointerEvent) {
@@ -637,13 +1293,16 @@
 		let selectedHandle: TransformGesture['handle'];
 		if (Math.hypot(point.x - rotate.x, point.y - rotate.y) <= 12) kind = 'rotate';
 		else {
-			const hit = handles.find((handle) => Math.hypot(point.x - handle.point.x, point.y - handle.point.y) <= 14);
+			const hit = handles.find(
+				(handle) => Math.hypot(point.x - handle.point.x, point.y - handle.point.y) <= 14
+			);
 			if (hit) {
 				kind = 'scale';
 				selectedHandle = { x: hit.x, y: hit.y };
 			}
 		}
-		if (!kind &&
+		if (
+			!kind &&
 			local.x >= bounds.minX &&
 			local.x <= bounds.maxX &&
 			local.y >= bounds.minY &&
@@ -651,7 +1310,8 @@
 		)
 			kind = 'move';
 		if (!kind) return;
-		canvas.setPointerCapture(event.pointerId);
+		buildLayerTransformCache();
+		overlayCanvas.setPointerCapture(event.pointerId);
 		transformGesture = {
 			kind,
 			pointerId: event.pointerId,
@@ -708,7 +1368,7 @@
 			activeLayer.transform.x = before.x + offsetX * Math.cos(angle) - offsetY * Math.sin(angle);
 			activeLayer.transform.y = before.y + offsetX * Math.sin(angle) + offsetY * Math.cos(angle);
 		}
-		redraw();
+		scheduleTransformPreview();
 	}
 
 	function zoomCanvas(event: WheelEvent) {
@@ -739,6 +1399,7 @@
 	}
 
 	function openRadialMenu(event: MouseEvent) {
+		return;
 		event.preventDefault();
 		cancelCanvasInteraction();
 		const rect = canvas.getBoundingClientRect();
@@ -761,8 +1422,8 @@
 	function finishTransform(event?: PointerEvent) {
 		const gesture = transformGesture;
 		if (!gesture) return;
-		if (event && canvas.hasPointerCapture(event.pointerId))
-			canvas.releasePointerCapture(event.pointerId);
+		if (event && overlayCanvas.hasPointerCapture(event.pointerId))
+			overlayCanvas.releasePointerCapture(event.pointerId);
 		const after = copyTransform(activeLayer.transform);
 		if (JSON.stringify(gesture.before) !== JSON.stringify(after)) {
 			globalUndo.push({
@@ -774,6 +1435,10 @@
 			globalRedo.length = 0;
 		}
 		transformGesture = null;
+		if (transformPreviewFrame) cancelAnimationFrame(transformPreviewFrame);
+		transformPreviewFrame = 0;
+		layerTransformCache = null;
+		transformSceneCache = null;
 		redraw();
 	}
 
@@ -788,7 +1453,11 @@
 		if (entry.kind === 'stroke') {
 			const strokeIndex = layer.strokes.findIndex((stroke) => stroke.id === entry.strokeId);
 			if (strokeIndex >= 0) layer.strokes.splice(strokeIndex, 1);
-		} else layer.transform = copyTransform(entry.before);
+		} else if (entry.kind === 'transform') layer.transform = copyTransform(entry.before);
+		else {
+			const stroke = layer.strokes.find((candidate) => candidate.id === entry.strokeId);
+			if (stroke) stroke.points = entry.before.map((point) => ({ ...point }));
+		}
 		globalRedo.push(entry);
 		redraw();
 	}
@@ -802,7 +1471,11 @@
 		const layer = layers.find((candidate) => candidate.id === entry.layerId);
 		if (!layer) return;
 		if (entry.kind === 'stroke') layer.strokes.push(entry.stroke);
-		else layer.transform = copyTransform(entry.after);
+		else if (entry.kind === 'transform') layer.transform = copyTransform(entry.after);
+		else {
+			const stroke = layer.strokes.find((candidate) => candidate.id === entry.strokeId);
+			if (stroke) stroke.points = entry.after.map((point) => ({ ...point }));
+		}
 		globalUndo.push(entry);
 		redraw();
 	}
@@ -836,7 +1509,12 @@
 		const element = new Image();
 		element.onload = () => {
 			const center = screenToWorld({ x: canvasWidth / 2, y: canvasHeight / 2 });
-			const fit = Math.min(1, (canvasWidth * 0.7) / element.naturalWidth, (canvasHeight * 0.7) / element.naturalHeight) / camera.zoom;
+			const fit =
+				Math.min(
+					1,
+					(canvasWidth * 0.7) / element.naturalWidth,
+					(canvasHeight * 0.7) / element.naturalHeight
+				) / camera.zoom;
 			const width = element.naturalWidth * fit;
 			const height = element.naturalHeight * fit;
 			const id = nextLayerId++;
@@ -868,8 +1546,10 @@
 			transformPoint({ x: bounds.minX, y: bounds.maxY }, layer)
 		];
 		return {
-			minX: Math.min(...corners.map((p) => p.x)), minY: Math.min(...corners.map((p) => p.y)),
-			maxX: Math.max(...corners.map((p) => p.x)), maxY: Math.max(...corners.map((p) => p.y))
+			minX: Math.min(...corners.map((p) => p.x)),
+			minY: Math.min(...corners.map((p) => p.y)),
+			maxX: Math.max(...corners.map((p) => p.x)),
+			maxY: Math.max(...corners.map((p) => p.y))
 		};
 	}
 
@@ -878,7 +1558,14 @@
 		target.save();
 		target.globalAlpha = layer.opacity;
 		applyLayerTransform(layer, target);
-		if (layer.image) target.drawImage(layer.image.element, layer.image.x, layer.image.y, layer.image.width, layer.image.height);
+		if (layer.image)
+			target.drawImage(
+				layer.image.element,
+				layer.image.x,
+				layer.image.y,
+				layer.image.width,
+				layer.image.height
+			);
 		for (const stroke of layer.strokes) drawStroke(stroke, target);
 		target.restore();
 	}
@@ -886,8 +1573,11 @@
 	function mergeDown() {
 		const topIndex = layers.findIndex((layer) => layer.id === activeLayerId);
 		if (topIndex <= 0) return;
-		const bottom = layers[topIndex - 1], top = layers[topIndex];
-		const boundsList = [layerWorldBounds(bottom), layerWorldBounds(top)].filter((value) => value !== null);
+		const bottom = layers[topIndex - 1],
+			top = layers[topIndex];
+		const boundsList = [layerWorldBounds(bottom), layerWorldBounds(top)].filter(
+			(value) => value !== null
+		);
 		if (!boundsList.length) return;
 		const minX = Math.floor(Math.min(...boundsList.map((b) => b.minX)) - 2);
 		const minY = Math.floor(Math.min(...boundsList.map((b) => b.minY)) - 2);
@@ -904,11 +1594,31 @@
 		const element = new Image();
 		const src = mergedCanvas.toDataURL('image/png');
 		element.onload = () => {
-			const merged: Layer = { id: bottom.id, name: `${bottom.name} + ${top.name}`, visible: true, locked: bottom.locked || top.locked, opacity: 1, strokes: [], image: { element, src, x: minX, y: minY, width: mergedCanvas.width, height: mergedCanvas.height }, transform: identityTransform() };
+			const merged: Layer = {
+				id: bottom.id,
+				name: `${bottom.name} + ${top.name}`,
+				visible: true,
+				locked: bottom.locked || top.locked,
+				opacity: 1,
+				strokes: [],
+				image: {
+					element,
+					src,
+					x: minX,
+					y: minY,
+					width: mergedCanvas.width,
+					height: mergedCanvas.height
+				},
+				transform: identityTransform()
+			};
 			layers.splice(topIndex - 1, 2, merged);
 			activeLayerId = merged.id;
-			globalUndo = globalUndo.filter((entry) => entry.layerId !== bottom.id && entry.layerId !== top.id);
-			globalRedo = globalRedo.filter((entry) => entry.layerId !== bottom.id && entry.layerId !== top.id);
+			globalUndo = globalUndo.filter(
+				(entry) => entry.layerId !== bottom.id && entry.layerId !== top.id
+			);
+			globalRedo = globalRedo.filter(
+				(entry) => entry.layerId !== bottom.id && entry.layerId !== top.id
+			);
 			redraw();
 		};
 		element.src = src;
@@ -969,7 +1679,8 @@
 				{ x: bounds.maxX, y: bounds.minY },
 				{ x: bounds.maxX, y: bounds.maxY },
 				{ x: bounds.minX, y: bounds.maxY }
-			]) points.push(transformPoint(point, layer));
+			])
+				points.push(transformPoint(point, layer));
 		}
 		if (!points.length) return null;
 		const padding = 24;
@@ -994,7 +1705,14 @@
 			targetContext.save();
 			targetContext.globalAlpha = layer.opacity;
 			applyLayerTransform(layer, targetContext);
-			if (layer.image) targetContext.drawImage(layer.image.element, layer.image.x, layer.image.y, layer.image.width, layer.image.height);
+			if (layer.image)
+				targetContext.drawImage(
+					layer.image.element,
+					layer.image.x,
+					layer.image.y,
+					layer.image.width,
+					layer.image.height
+				);
 			for (const stroke of layer.strokes) {
 				if (count++ >= limit) break;
 				drawStroke(stroke, targetContext);
@@ -1041,11 +1759,17 @@
 
 	async function exportAnimation() {
 		const bounds = artworkBounds();
-		const strokeCount = layers.reduce((sum, layer) => sum + (layer.visible ? layer.strokes.length : 0), 0);
+		const strokeCount = layers.reduce(
+			(sum, layer) => sum + (layer.visible ? layer.strokes.length : 0),
+			0
+		);
 		if (!bounds || !strokeCount || !('MediaRecorder' in window)) return;
 		const output = document.createElement('canvas');
 		const maxDimension = 1920;
-		const scale = Math.min(1, maxDimension / Math.max(bounds.maxX - bounds.minX, bounds.maxY - bounds.minY));
+		const scale = Math.min(
+			1,
+			maxDimension / Math.max(bounds.maxX - bounds.minX, bounds.maxY - bounds.minY)
+		);
 		output.width = Math.max(1, Math.ceil((bounds.maxX - bounds.minX) * scale));
 		output.height = Math.max(1, Math.ceil((bounds.maxY - bounds.minY) * scale));
 		const stream = output.captureStream(30);
@@ -1109,6 +1833,7 @@
 			bind:taper
 			bind:globalHistory
 			bind:tool
+			bind:shape
 			bind:gridVisible
 			bind:radialSlots
 			{activeLayer}
@@ -1122,6 +1847,16 @@
 			onexportanimation={exportAnimation}
 			onrotateview={rotateView}
 			onresetview={resetView}
+		/>
+		<CollaborationPanel
+			bind:this={collaborationPanel}
+			bind:color
+			bind:brushSize
+			onstroke={receiveRemoteStroke}
+			oncursor={receiveRemoteCursor}
+			onpeerjoined={ensureRemoteLayer}
+			onpeerleft={remotePeerLeft}
+			onreset={resetRemotePresence}
 		/>
 		<LayersPanel
 			{layers}
@@ -1137,20 +1872,46 @@
 			onopacitychange={redraw}
 			onresettransform={resetTransform}
 		/>
-			<DrawingCanvas
+		<DrawingCanvas
 			bind:canvas
+			bind:overlayCanvas
 			{tool}
 			onwheel={zoomCanvas}
 			onpointerdown={startDrawing}
 			onpointermove={draw}
-			onpointerup={stopDrawing}
-			ondoublepress={openRadialMenu}
+				onpointerup={stopDrawing}
+				onpointerleave={pointerLeft}
+				ondoublepress={openRadialMenu}
 		/>
+		{#each Object.values(remoteCursors) as cursor (cursor.id)}
+			{#if cursor.visible}
+				{@const screen = remoteCursorScreen(cursor)}
+				<div
+					class="remote-cursor"
+					style:left={`${screen.x}px`}
+					style:top={`${screen.y}px`}
+					style:--cursor-color={cursor.color}
+				>
+					<span></span><small>{cursor.name}</small>
+				</div>
+			{/if}
+		{/each}
 		{#if radialMenu}
-			<div class="radial-menu" style:left={`${radialMenu.x}px`} style:top={`${radialMenu.y}px`} role="menu">
-				<button class="radial-close" onclick={() => (radialMenu = null)} aria-label="Close quick menu">×</button>
+			<div
+				class="radial-menu"
+				style:left={`${radialMenu.x}px`}
+				style:top={`${radialMenu.y}px`}
+				role="menu"
+			>
+				<button
+					class="radial-close"
+					onclick={() => (radialMenu = null)}
+					aria-label="Close quick menu">×</button
+				>
 				{#each radialSlots as action, index}
-					<button class="radial-action" style:--slot={index} onclick={() => runRadialAction(action)}>{action}</button>
+					<button class="radial-action" style:--slot={index} onclick={() => runRadialAction(action)}
+						>{action}</button
+					>
 				{/each}
 			</div>
 		{/if}

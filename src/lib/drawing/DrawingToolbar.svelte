@@ -21,7 +21,8 @@
 		onresetview,
 		gridVisible = $bindable(),
 		radialSlots = $bindable(),
-		tool = $bindable()
+		tool = $bindable(),
+		shape = $bindable()
 	}: {
 		colors: string[];
 		color: string;
@@ -35,7 +36,8 @@
 		onundo: () => void;
 		onredo: () => void;
 		onclear: () => void;
-		tool: 'draw' | 'transform' | 'pan';
+		tool: 'draw' | 'edit' | 'transform' | 'pan';
+		shape: 'freehand' | 'line' | 'rectangle' | 'ellipse' | 'bezier';
 		onexportview: () => void;
 		onexportall: () => void;
 		onexportanimation: () => void;
@@ -102,6 +104,11 @@
 			aria-pressed={tool === 'draw'}>Draw</button
 		>
 		<button
+			class:active={tool === 'edit'}
+			onclick={() => (tool = 'edit')}
+			aria-pressed={tool === 'edit'}>Edit</button
+		>
+		<button
 			class:active={tool === 'transform'}
 			onclick={() => (tool = 'transform')}
 			aria-pressed={tool === 'transform'}>Transform</button
@@ -111,6 +118,24 @@
 			onclick={() => (tool = 'pan')}
 			aria-pressed={tool === 'pan'}>Pan</button
 		>
+	</div>
+	<div class="tool-picker shape-picker" aria-label="Drawing shape">
+		{#each [
+			['freehand', 'Freehand'],
+			['line', 'Line'],
+			['rectangle', 'Rectangle'],
+			['ellipse', 'Ellipse'],
+			['bezier', 'Bézier']
+		] as option}
+			<button
+				class:active={shape === option[0] && tool === 'draw'}
+				onclick={() => {
+					shape = option[0] as typeof shape;
+					tool = 'draw';
+				}}
+				aria-pressed={shape === option[0] && tool === 'draw'}>{option[1]}</button
+			>
+		{/each}
 	</div>
 	<!--
 	<div class="divider"></div>
@@ -140,7 +165,7 @@
 			max="12"
 			step="1"
 			bind:value={smoothingSteps}
-			aria-label="Bézier curve smoothing"
+			aria-label="Brush trail smoothing"
 		/>
 		<output>{smoothingSteps}</output>
 	</label>

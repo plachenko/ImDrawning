@@ -40,3 +40,15 @@ npm run build
 You can preview the production build with `npm run preview`.
 
 > To deploy your app, you may need to install an [adapter](https://svelte.dev/docs/kit/adapters) for your target environment.
+# Device collaboration
+
+Start the app and WebSocket relay in separate terminals:
+
+```sh
+npm run dev -- --host
+npm run collab
+```
+
+Open **Share**, enter `ws://<host-local-ip>:8787`, and choose **Start room**. Other devices on
+the same network can scan the displayed QR code or enter the IP and room code. Camera scanning
+requires a browser that supports `BarcodeDetector` and permission to use the camera.

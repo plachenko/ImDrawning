@@ -1,4 +1,4 @@
-export type Point = { x: number; y: number };
+export type Point = { x: number; y: number; time?: number };
 
 export type Stroke = {
 	id: number;
@@ -7,6 +7,7 @@ export type Stroke = {
 	size: number;
 	smoothing: number;
 	taper: number;
+	shape?: 'freehand' | 'line' | 'rectangle' | 'ellipse' | 'bezier';
 };
 
 export type LayerTransform = {
