@@ -1,11 +1,38 @@
 import { createServer } from 'node:http';
+import { createReadStream, existsSync, statSync } from 'node:fs';
+import { extname, join, normalize } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { WebSocketServer, WebSocket } from 'ws';
 
 const port = Number(process.env.PORT || 8787);
+const staticRoot = fileURLToPath(new URL('../build/', import.meta.url));
+const contentTypes = {
+	'.css': 'text/css; charset=utf-8',
+	'.html': 'text/html; charset=utf-8',
+	'.ico': 'image/x-icon',
+	'.js': 'text/javascript; charset=utf-8',
+	'.json': 'application/json; charset=utf-8',
+	'.png': 'image/png',
+	'.svg': 'image/svg+xml',
+	'.webp': 'image/webp'
+};
 const rooms = new Map();
 const server = createServer((request, response) => {
-	response.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
-	response.end('ImDrawning collaboration relay is running.\n');
+	const pathname = decodeURIComponent(new URL(request.url || '/', 'http://localhost').pathname);
+	const relativePath = normalize(pathname).replace(/^(\.\.(\/|\\|$))+/, '').replace(/^[/\\]+/, '');
+	let filePath = join(staticRoot, relativePath || 'index.html');
+	if (existsSync(filePath) && statSync(filePath).isDirectory()) filePath = join(filePath, 'index.html');
+	if (!existsSync(filePath)) filePath = join(staticRoot, 'index.html');
+	if (!existsSync(filePath)) {
+		response.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+		response.end('ImDrawning collaboration relay is running.\n');
+		return;
+	}
+	response.writeHead(200, {
+		'content-type': contentTypes[extname(filePath)] || 'application/octet-stream',
+		'cache-control': extname(filePath) === '.html' ? 'no-cache' : 'public, max-age=31536000, immutable'
+	});
+	createReadStream(filePath).pipe(response);
 });
 const sockets = new WebSocketServer({ server, maxPayload: 2_000_000 });
 const colors = ['#ef4444', '#f59e0b', '#16a34a', '#2563eb', '#7c3aed', '#db2777'];

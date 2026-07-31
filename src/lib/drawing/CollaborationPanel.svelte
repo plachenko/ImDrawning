@@ -35,7 +35,12 @@
 
 	onMount(() => {
 		const params = new URLSearchParams(location.search);
-		serverUrl = params.get('collabWs') || `ws://${location.hostname || 'localhost'}:8787`;
+		const localDevelopment = location.protocol === 'http:' && location.port !== '8787';
+		serverUrl =
+			params.get('collabWs') ||
+			(localDevelopment
+				? `ws://${location.hostname || 'localhost'}:8787`
+				: `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}`);
 		room = params.get('room') || '';
 		role = params.get('role') === 'control' ? 'control' : 'draw';
 		return disconnect;
@@ -44,7 +49,7 @@
 	function normalizeServer(value: string) {
 		const trimmed = value.trim().replace(/\/$/, '');
 		if (/^wss?:\/\//i.test(trimmed)) return trimmed;
-		return `ws://${trimmed}`;
+		return `${location.protocol === 'https:' ? 'wss' : 'ws'}://${trimmed}`;
 	}
 
 	function makeRoom() {
@@ -187,6 +192,6 @@
 			<label>Remote size<input type="range" min="2" max="28" bind:value={brushSize} oninput={sendParameters} /></label>
 		{/if}
 		{#if scanning}<div class="scanner"><video bind:this={video} muted playsinline></video><button onclick={stopScanner}>Cancel scan</button></div>{/if}
-		<small>Run <code>npm run collab</code> on the host, then use its local IP above.</small>
+		<small>Hosted builds connect securely to this page by default. For local sharing, run <code>npm run collab</code> and use the host's local IP.</small>
 	</aside>
 {/if}

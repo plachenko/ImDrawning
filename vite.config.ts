@@ -3,6 +3,8 @@ import adapter from '@sveltejs/adapter-static';
 import { sveltekit } from '@sveltejs/kit/vite';
 import { defineConfig } from 'vite';
 
+const productionBase = (process.env.APP_BASE_PATH ?? '/ImDrawning') as '' | `/${string}`;
+
 export default defineConfig({
 	plugins: [
 		tailwindcss(),
@@ -15,7 +17,7 @@ export default defineConfig({
 
 			adapter: adapter(),
 			paths: {
-				base: process.env.NODE_ENV === 'production' ? '/ImDrawning' : ''
+				base: process.env.NODE_ENV === 'production' ? productionBase : ''
 			}
 		})
 	]
