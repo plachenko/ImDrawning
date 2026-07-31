@@ -2,7 +2,7 @@ app = "imdrawning-collab"
 primary_region = "iad"
 
 [build]
-  builder = "paketobuildpacks/builder-jammy-base"
+  dockerfile = "Dockerfile"
 
 [processes]
   app = "node scripts/collab-server.mjs"
