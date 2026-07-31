@@ -1,0 +1,20 @@
+app = "imdrawning-collab"
+primary_region = "iad"
+
+[build]
+  builder = "paketobuildpacks/builder-jammy-base"
+
+[processes]
+  app = "node scripts/collab-server.mjs"
+
+[http_service]
+  internal_port = 8787
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ["app"]
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

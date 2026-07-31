@@ -596,6 +596,67 @@
 		overlayContext.clearRect(0, 0, canvasWidth, canvasHeight);
 	}
 
+	function predictedStroke(stroke: Stroke): Stroke {
+		if ((stroke.shape ?? 'freehand') !== 'freehand' || stroke.points.length < 3) return stroke;
+
+		const recent = stroke.points.slice(-6);
+		let velocityX = 0;
+		let velocityY = 0;
+		let totalWeight = 0;
+		let directionConfidence = 1;
+		for (let index = 1; index < recent.length; index++) {
+			const before = recent[index - 1];
+			const point = recent[index];
+			const elapsed = Math.max(1, (point.time ?? 0) - (before.time ?? 0));
+			const segmentX = (point.x - before.x) / elapsed;
+			const segmentY = (point.y - before.y) / elapsed;
+			const weight = index * index;
+			if (totalWeight > 0) {
+				const oldLength = Math.hypot(velocityX, velocityY);
+				const newLength = Math.hypot(segmentX, segmentY);
+				if (oldLength > 0 && newLength > 0) {
+					const alignment =
+						(velocityX * segmentX + velocityY * segmentY) / (oldLength * newLength);
+					directionConfidence = Math.min(directionConfidence, Math.max(0, alignment));
+				}
+			}
+			velocityX += segmentX * weight;
+			velocityY += segmentY * weight;
+			totalWeight += weight;
+		}
+		if (!totalWeight) return stroke;
+
+		velocityX /= totalWeight;
+		velocityY /= totalWeight;
+		const speed = Math.hypot(velocityX, velocityY);
+		if (speed < 0.01) return stroke;
+
+		// Look roughly one input frame ahead. Direction confidence shortens the
+		// prediction while turning, and the screen-space cap prevents wild tails.
+		const horizon = 18 * (0.25 + directionConfidence * 0.75);
+		const distance = Math.min(speed * horizon, 24 / camera.zoom);
+		const tip = recent[recent.length - 1];
+		const unitX = velocityX / speed;
+		const unitY = velocityY / speed;
+		const predictedTip: Point = {
+			x: tip.x + unitX * distance,
+			y: tip.y + unitY * distance,
+			time: (tip.time ?? 0) + horizon
+		};
+		return {
+			...stroke,
+			points: [
+				...stroke.points,
+				{
+					x: tip.x + (predictedTip.x - tip.x) * 0.5,
+					y: tip.y + (predictedTip.y - tip.y) * 0.5,
+					time: (tip.time ?? 0) + horizon * 0.5
+				},
+				predictedTip
+			]
+		};
+	}
+
 	function renderStrokePreview() {
 		strokePreviewFrame = 0;
 		clearStrokePreview();
@@ -606,7 +667,7 @@
 		overlayContext.scale(camera.zoom, camera.zoom);
 		applyLayerTransform(activeLayer, overlayContext);
 		overlayContext.globalAlpha = activeLayer.opacity;
-		drawStroke(activeStroke, overlayContext);
+		drawStroke(predictedStroke(activeStroke), overlayContext);
 		overlayContext.restore();
 	}
 
@@ -1192,54 +1253,13 @@
 	function receiveRemoteStroke(user: CollaborationUser, stroke: Stroke) {
 		if (!stroke || !Array.isArray(stroke.points)) return;
 		const layer = ensureRemoteLayer(user);
-		const strokeId = nextStrokeId++;
 		const remoteStroke: Stroke = {
 			...stroke,
-			id: strokeId,
-			color: user.color,
+			id: nextStrokeId++,
 			points: stroke.points.map((point) => ({ ...point }))
 		};
-		if ((remoteStroke.shape ?? 'freehand') !== 'freehand' || remoteStroke.points.length < 3) {
-			layer.strokes.push(remoteStroke);
-			redraw(false);
-			const start = remoteStroke.points[0];
-			const end = remoteStroke.points[remoteStroke.points.length - 1];
-			if (start && end) {
-				const cursorStarted = performance.now();
-				const replayCursor = (now: number) => {
-					const amount = Math.min(1, (now - cursorStarted) / 260);
-					remoteCursors[user.id] = {
-						...user,
-						x: start.x + (end.x - start.x) * amount,
-						y: start.y + (end.y - start.y) * amount,
-						visible: true
-					};
-					if (amount < 1) requestAnimationFrame(replayCursor);
-				};
-				requestAnimationFrame(replayCursor);
-			}
-			return;
-		}
-		const completedPoints = remoteStroke.points;
-		remoteStroke.points = completedPoints.slice(0, 1);
 		layer.strokes.push(remoteStroke);
-		const started = performance.now();
-		const duration = Math.min(1400, Math.max(180, completedPoints.length * 10));
-		const replay = (now: number) => {
-			const progress = Math.min(1, (now - started) / duration);
-			const count = Math.max(1, Math.ceil(completedPoints.length * progress));
-			remoteStroke.points = completedPoints.slice(0, count);
-			const cursorPoint = completedPoints[count - 1];
-			remoteCursors[user.id] = {
-				...user,
-				x: cursorPoint.x,
-				y: cursorPoint.y,
-				visible: true
-			};
-			redraw(false);
-			if (progress < 1) requestAnimationFrame(replay);
-		};
-		requestAnimationFrame(replay);
+		redraw(false);
 	}
 
 	function receiveRemoteCursor(user: CollaborationUser, x: number, y: number, visible: boolean) {
