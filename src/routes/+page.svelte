@@ -9,7 +9,15 @@
 	type HistoryEntry =
 		| { kind: 'stroke'; layerId: number; strokeId: number; stroke: Stroke }
 		| { kind: 'transform'; layerId: number; before: LayerTransform; after: LayerTransform }
-		| { kind: 'edit'; layerId: number; strokeId: number; before: Point[]; after: Point[] };
+		| {
+				kind: 'edit';
+				layerId: number;
+				strokeId: number;
+				before: Point[];
+				after: Point[];
+				beforeShape?: Stroke['shape'];
+				afterShape?: Stroke['shape'];
+		  };
 	type TransformGesture = {
 		kind: 'move' | 'scale' | 'rotate';
 		pointerId: number;
@@ -24,7 +32,9 @@
 	let overlayCanvas = $state<HTMLCanvasElement>(null!);
 	let collaborationPanel: CollaborationPanel;
 	let remoteLayerIds = new Map<string, number>();
-	let remoteCursors = $state<Record<string, CollaborationUser & { x: number; y: number; visible: boolean }>>({});
+	let remoteCursors = $state<
+		Record<string, CollaborationUser & { x: number; y: number; visible: boolean }>
+	>({});
 	let context: CanvasRenderingContext2D | null = null;
 	let overlayContext: CanvasRenderingContext2D | null = null;
 	let strokePreviewFrame = 0;
@@ -67,7 +77,15 @@
 	let tool = $state<'draw' | 'edit' | 'transform' | 'pan'>('draw');
 	let shape = $state<'freehand' | 'line' | 'rectangle' | 'ellipse' | 'bezier'>('freehand');
 	let selectedStrokeId = $state<number | null>(null);
-	let editGesture: { pointerId: number; stroke: Stroke; handle: number; before: Point[] } | null = null;
+	let editGesture: {
+		pointerId: number;
+		stroke: Stroke;
+		mode: 'handle' | 'bend-line';
+		handle: number;
+		bendT?: number;
+		before: Point[];
+		beforeShape?: Stroke['shape'];
+	} | null = null;
 	let camera = $state({ x: 0, y: 0, zoom: 1, rotation: 0 });
 	let gridVisible = $state(true);
 	let radialSlots = $state(['Draw', 'Undo', 'Transform', 'Reset view']);
@@ -615,8 +633,7 @@
 				const oldLength = Math.hypot(velocityX, velocityY);
 				const newLength = Math.hypot(segmentX, segmentY);
 				if (oldLength > 0 && newLength > 0) {
-					const alignment =
-						(velocityX * segmentX + velocityY * segmentY) / (oldLength * newLength);
+					const alignment = (velocityX * segmentX + velocityY * segmentY) / (oldLength * newLength);
 					directionConfidence = Math.min(directionConfidence, Math.max(0, alignment));
 				}
 			}
@@ -900,7 +917,10 @@
 		const dy = end.y - start.y;
 		const lengthSquared = dx * dx + dy * dy;
 		const amount = lengthSquared
-			? Math.max(0, Math.min(1, ((point.x - start.x) * dx + (point.y - start.y) * dy) / lengthSquared))
+			? Math.max(
+					0,
+					Math.min(1, ((point.x - start.x) * dx + (point.y - start.y) * dy) / lengthSquared)
+				)
 			: 0;
 		return Math.hypot(point.x - (start.x + dx * amount), point.y - (start.y + dy * amount));
 	}
@@ -921,8 +941,8 @@
 			for (let index = 0; index <= 32; index++) {
 				const angle = (index / 32) * Math.PI * 2;
 				points.push({
-					x: centerX + Math.cos(angle) * Math.abs(end.x - start.x) / 2,
-					y: centerY + Math.sin(angle) * Math.abs(end.y - start.y) / 2
+					x: centerX + (Math.cos(angle) * Math.abs(end.x - start.x)) / 2,
+					y: centerY + (Math.sin(angle) * Math.abs(end.y - start.y)) / 2
 				});
 			}
 		} else if (stroke.points.length >= 4) {
@@ -931,8 +951,16 @@
 				const t = index / 32;
 				const inverse = 1 - t;
 				points.push({
-					x: inverse ** 3 * p0.x + 3 * inverse ** 2 * t * p1.x + 3 * inverse * t ** 2 * p2.x + t ** 3 * p3.x,
-					y: inverse ** 3 * p0.y + 3 * inverse ** 2 * t * p1.y + 3 * inverse * t ** 2 * p2.y + t ** 3 * p3.y
+					x:
+						inverse ** 3 * p0.x +
+						3 * inverse ** 2 * t * p1.x +
+						3 * inverse * t ** 2 * p2.x +
+						t ** 3 * p3.x,
+					y:
+						inverse ** 3 * p0.y +
+						3 * inverse ** 2 * t * p1.y +
+						3 * inverse * t ** 2 * p2.y +
+						t ** 3 * p3.y
 				});
 			}
 		}
@@ -947,21 +975,49 @@
 		const point = localPosition(event);
 		const threshold = 12 / camera.zoom;
 		let stroke = editableStroke();
-		let handle = stroke?.points.findIndex((candidate) => Math.hypot(candidate.x - point.x, candidate.y - point.y) <= threshold) ?? -1;
+		let handle =
+			stroke?.points.findIndex(
+				(candidate) => Math.hypot(candidate.x - point.x, candidate.y - point.y) <= threshold
+			) ?? -1;
 		if (handle < 0) {
-			stroke = [...activeLayer.strokes]
-				.reverse()
-				.find((candidate) => strokeHitDistance(candidate, point) <= threshold + candidate.size / 2) ?? null;
+			stroke =
+				[...activeLayer.strokes]
+					.reverse()
+					.find(
+						(candidate) => strokeHitDistance(candidate, point) <= threshold + candidate.size / 2
+					) ?? null;
 			selectedStrokeId = stroke?.id ?? null;
-			handle = stroke?.points.findIndex((candidate) => Math.hypot(candidate.x - point.x, candidate.y - point.y) <= threshold) ?? -1;
+			handle =
+				stroke?.points.findIndex(
+					(candidate) => Math.hypot(candidate.x - point.x, candidate.y - point.y) <= threshold
+				) ?? -1;
 		}
-		if (stroke && handle >= 0) {
+		if (stroke && (handle >= 0 || stroke.shape === 'line')) {
+			const start = stroke.points[0];
+			const end = stroke.points[stroke.points.length - 1];
+			const dx = end.x - start.x;
+			const dy = end.y - start.y;
+			const lengthSquared = dx * dx + dy * dy;
 			overlayCanvas.setPointerCapture(event.pointerId);
 			editGesture = {
 				pointerId: event.pointerId,
 				stroke,
+				mode: handle >= 0 ? 'handle' : 'bend-line',
 				handle,
-				before: stroke.points.map((candidate) => ({ ...candidate }))
+				bendT:
+					handle < 0
+						? Math.max(
+								0.05,
+								Math.min(
+									0.95,
+									lengthSquared
+										? ((point.x - start.x) * dx + (point.y - start.y) * dy) / lengthSquared
+										: 0.5
+								)
+							)
+						: undefined,
+				before: stroke.points.map((candidate) => ({ ...candidate })),
+				beforeShape: stroke.shape
 			};
 		}
 		redraw(false);
@@ -1144,7 +1200,29 @@
 			return;
 		}
 		if (editGesture && event.pointerId === editGesture.pointerId) {
-			editGesture.stroke.points[editGesture.handle] = localPosition(event);
+			const pointer = localPosition(event);
+			if (editGesture.mode === 'bend-line') {
+				const [start, end] = editGesture.before;
+				const t = editGesture.bendT ?? 0.5;
+				const inverse = 1 - t;
+				// Flash-style line bending is a quadratic curve whose endpoints stay fixed.
+				// Convert it to the cubic representation already used by the editor.
+				const denominator = 2 * inverse * t;
+				const control = {
+					x: (pointer.x - inverse * inverse * start.x - t * t * end.x) / denominator,
+					y: (pointer.y - inverse * inverse * start.y - t * t * end.y) / denominator
+				};
+				editGesture.stroke.shape = 'bezier';
+				editGesture.stroke.points = [
+					{ ...start },
+					{
+						x: start.x + (2 / 3) * (control.x - start.x),
+						y: start.y + (2 / 3) * (control.y - start.y)
+					},
+					{ x: end.x + (2 / 3) * (control.x - end.x), y: end.y + (2 / 3) * (control.y - end.y) },
+					{ ...end }
+				];
+			} else editGesture.stroke.points[editGesture.handle] = pointer;
 			redraw(false);
 			return;
 		}
@@ -1199,14 +1277,22 @@
 			if (event && overlayCanvas.hasPointerCapture(event.pointerId))
 				overlayCanvas.releasePointerCapture(event.pointerId);
 			const after = editGesture.stroke.points.map((point) => ({ ...point }));
-			globalUndo.push({
-				kind: 'edit',
-				layerId: activeLayer.id,
-				strokeId: editGesture.stroke.id,
-				before: editGesture.before,
-				after
-			});
-			globalRedo.length = 0;
+			const afterShape = editGesture.stroke.shape;
+			if (
+				JSON.stringify(editGesture.before) !== JSON.stringify(after) ||
+				editGesture.beforeShape !== afterShape
+			) {
+				globalUndo.push({
+					kind: 'edit',
+					layerId: activeLayer.id,
+					strokeId: editGesture.stroke.id,
+					before: editGesture.before,
+					after,
+					beforeShape: editGesture.beforeShape,
+					afterShape
+				});
+				globalRedo.length = 0;
+			}
 			editGesture = null;
 			redraw(false);
 			return;
@@ -1476,7 +1562,10 @@
 		} else if (entry.kind === 'transform') layer.transform = copyTransform(entry.before);
 		else {
 			const stroke = layer.strokes.find((candidate) => candidate.id === entry.strokeId);
-			if (stroke) stroke.points = entry.before.map((point) => ({ ...point }));
+			if (stroke) {
+				stroke.points = entry.before.map((point) => ({ ...point }));
+				stroke.shape = entry.beforeShape;
+			}
 		}
 		globalRedo.push(entry);
 		redraw();
@@ -1494,7 +1583,10 @@
 		else if (entry.kind === 'transform') layer.transform = copyTransform(entry.after);
 		else {
 			const stroke = layer.strokes.find((candidate) => candidate.id === entry.strokeId);
-			if (stroke) stroke.points = entry.after.map((point) => ({ ...point }));
+			if (stroke) {
+				stroke.points = entry.after.map((point) => ({ ...point }));
+				stroke.shape = entry.afterShape;
+			}
 		}
 		globalUndo.push(entry);
 		redraw();
@@ -1899,9 +1991,9 @@
 			onwheel={zoomCanvas}
 			onpointerdown={startDrawing}
 			onpointermove={draw}
-				onpointerup={stopDrawing}
-				onpointerleave={pointerLeft}
-				ondoublepress={openRadialMenu}
+			onpointerup={stopDrawing}
+			onpointerleave={pointerLeft}
+			ondoublepress={openRadialMenu}
 		/>
 		{#each Object.values(remoteCursors) as cursor (cursor.id)}
 			{#if cursor.visible}

@@ -46,10 +46,10 @@
 			>{tool === 'pan'
 				? 'Drag to pan · scroll to zoom'
 				: tool === 'transform'
-				? 'Two fingers over layer move, scale, and rotate · move outside it to transform the canvas'
-				: tool === 'edit'
-					? 'Select a shape, then drag its blue handles'
-				: 'Draw freely'}</span
+					? 'Two fingers over layer move, scale, and rotate · move outside it to transform the canvas'
+					: tool === 'edit'
+						? 'Drag a line to bend it · drag blue handles to refine it'
+						: 'Draw freely'}</span
 		><span class="footer-dot">•</span><span><kbd>⌘</kbd> <kbd>Z</kbd> to undo</span><span
 			class="footer-dot">•</span
 		><span>Your drawing stays in this tab</span>
